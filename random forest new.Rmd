@@ -1,0 +1,477 @@
+---
+title: "Random Forest Training"
+output:
+  html_document: default
+  pdf_document: default
+date: "2025-08-06"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+**Training Dataset Simulation**
+```{r}
+
+library(MASS) 
+library(dplyr)
+library(randomForest)
+
+set.seed(814)
+
+N <- 100   # number of individuals
+T <- 10    # number of observations per individual
+price_range <- c(3, 8)
+
+#Simulate individual-level covariates
+age <- sample(18:70, N, replace = TRUE)
+gender <- sample(c(0, 1), N, replace = TRUE)        # 0 = female, 1 = male
+urban <- sample(c(0, 1), N, replace = TRUE)         # 0 = rural, 1 = urban
+
+# Create design matrix for individual-level covariates (excluding price)
+indiv_covariates <- data.frame(id = 1:N, age = age, gender = gender, urban = urban)
+
+#Simulate individual-specific coefficients: beta_i ~ N(mu_, Sigma_)
+#intercept, price, age, gender, urban
+mu_ <- c(0, -0.8, 0.01, 0.5, 0.3)
+Sigma_ <- matrix(c(
+  1.5, 0.1,  0.05, 0.1, 0.05,
+  0.1, 0.5, -0.02, 0.0, 0.02,
+  0.05, -0.02, 0.2, 0.01, 0.0,
+  0.1,  0.0,  0.01, 0.4, 0.03,
+  0.05, 0.02, 0.0,  0.03, 0.3
+), nrow = 5, byrow = TRUE)
+
+beta_i <- mvrnorm(n = N, mu = mu_, Sigma = Sigma_)
+
+#Simulate data using hierarchical logit model
+sim_binary <- data.frame()
+
+for (i in 1:N) {
+  for (t in 1:T) {
+    price <- runif(1, price_range[1], price_range[2])
+    X <- c(1, price, age[i], gender[i], urban[i])  # feature vector
+    utility <- sum(X * beta_i[i, ])
+    p <- 1 / (1 + exp(-utility))                   # logistic probability
+    y <- rbinom(1, 1, p)                           # purchase decision
+
+    sim_binary <- rbind(sim_binary, data.frame(
+      id = i,
+      time = t,
+      price = price,
+      age = age[i],
+      gender = gender[i],
+      urban = urban[i],
+      purchase = y
+    ))
+  }
+}
+
+head(sim_binary)
+
+```
+
+**distribution of price coefficient**
+```{r}
+# Extract the price coefficients
+price_coef <- beta_i[, 2]  
+
+# Create a histogram
+hist(price_coef, 
+     breaks = 15, 
+     col = "skyblue", 
+     main = "",
+     xlab = "Price Coefficient (β_price)",
+     ylab = "Frequency")
+
+lines(density(price_coef), col = "red", lwd = 2)
+abline(v = mean(price_coef), col = "darkgreen", lwd = 2, lty = 2)
+summary(price_coef)
+
+```
+
+**ground truth construction of training dataset**
+```{r}
+# Define purchase probability and expected revenue functions
+purchase_prob <- function(X, beta) {
+  plogis(sum(X * beta))
+}
+
+expected_revenue <- function(price, X, beta) {
+  price * purchase_prob(X, beta)
+}
+
+price_options <- c(3, 8)
+ground_truth <- data.frame()
+
+for (i in 1:N) {
+  indiv_covs <- c(age[i], gender[i], urban[i])
+  X3 <- c(1, 3, indiv_covs)
+  X8 <- c(1, 8, indiv_covs)
+  
+  prob_3 <- purchase_prob(X3, beta_i[i, ])
+  prob_8 <- purchase_prob(X8, beta_i[i, ])
+  
+  rev_3 <- expected_revenue(3, X3, beta_i[i, ])
+  rev_8 <- expected_revenue(8, X8, beta_i[i, ])
+  
+  # Determine the optimal price based on ground truth
+  opt_price <- ifelse(rev_3 > rev_8, 3, 8)
+  
+  # Add both rows for each individual
+  ground_truth <- rbind(
+    ground_truth,
+    data.frame(
+      id = i,
+      price = 3,
+      predicted_prob = prob_3,
+      predicted_revenue = rev_3,
+      optimal_price = opt_price
+    ),
+    data.frame(
+      id = i,
+      price = 8,
+      predicted_prob = prob_8,
+      predicted_revenue = rev_8,
+      optimal_price = opt_price
+    )
+  )
+}
+
+head(ground_truth)
+
+total_optimal_revenue <- ground_truth %>%
+  filter(price == optimal_price) %>%
+  summarise(total_revenue = sum(predicted_revenue)) %>%
+  pull(total_revenue)
+
+cat("Total ground truth optimal revenue:", total_optimal_revenue, "\n")
+
+```
+**frequncy table of two prices under the ground truth pricing policy on training dataset**
+```{r}
+library(dplyr)
+
+count <- ground_truth %>%
+  group_by(optimal_price) %>%
+  summarise(count = n() / 2) %>%
+  arrange(optimal_price)
+
+print(count)
+```
+
+**fitting global random forest on training dataset**
+```{r}
+
+#fit global Random Forest on the entire sample
+set.seed(814)
+rf_model_global <- randomForest(
+  factor(purchase) ~ price + age + gender + urban,
+  data = sim_binary,
+  ntree = 200
+)
+
+price_given <- c(3, 8)
+
+individual_covs <- sim_binary %>%
+  group_by(id) %>%
+  dplyr::slice(1) %>% 
+  ungroup() %>%
+  select(id, age, gender, urban)
+
+
+newdata <- individual_covs %>%
+  tidyr::crossing(price = price_given) %>%
+  arrange(id, price)
+
+# Predict purchase probabilities
+pred_probs <- predict(rf_model_global, newdata, type = "prob")[, "1"]
+
+rf_predictions <- newdata %>%
+  mutate(predicted_prob = pred_probs,
+         predicted_revenue = predicted_prob * price)
+
+#potimal rf pricing policy
+rf_best_prices <- rf_predictions %>%
+  group_by(id) %>%
+  slice_max(predicted_revenue, n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  select(id, rf_optimal_price = price)
+
+rf_predictions <- rf_predictions %>%
+  left_join(rf_best_prices, by = "id")
+
+head(rf_predictions)
+
+```
+
+**frequncy table of two prices under the rf pricing policy on training dataset**
+```{r}
+rf_counts <- rf_predictions %>%
+  group_by(rf_optimal_price) %>%
+  summarise(count = n() / 2) %>%
+  arrange(rf_optimal_price)
+
+print(rf_counts)
+```
+
+**Calculation of the expected total revenue based on the rf pricing policy and the ground truth individual preferences**
+```{r}
+#define true purchase probability and expected revenue functions
+purchase_prob <- function(p, a, g, u, alpha, beta_price, beta_age, beta_gender, beta_urban) {
+  linpred <- alpha + beta_price * p + beta_age * a + beta_gender * g + beta_urban * u
+  plogis(linpred)
+}
+
+expected_revenue <- function(p, a, g, u, alpha, beta_price, beta_age, beta_gender, beta_urban) {
+  p * purchase_prob(p, a, g, u, alpha, beta_price, beta_age, beta_gender, beta_urban)
+}
+
+rf_eval <- rf_best_prices %>%
+  left_join(individual_covs, by = "id") %>%
+  mutate(
+    alpha        = beta_i[id, 1],
+    beta_price   = beta_i[id, 2],
+    beta_age     = beta_i[id, 3],
+    beta_gender  = beta_i[id, 4],
+    beta_urban   = beta_i[id, 5]
+  )
+
+#Evaluate policy using ground truth
+rf_eval <- rf_eval %>%
+  mutate(
+    true_prob = purchase_prob(rf_optimal_price, age, gender, urban,
+                              alpha, beta_price, beta_age, beta_gender, beta_urban),
+    true_revenue = expected_revenue(rf_optimal_price, age, gender, urban,
+                                    alpha, beta_price, beta_age, beta_gender, beta_urban)
+  )
+
+total_rf_policy_revenue <- sum(rf_eval$true_revenue)
+cat("Total revenue using Random Forest policy (evaluated with true preferences):",
+    total_rf_policy_revenue, "\n")
+
+```
+
+
+**hit rate on training dataset**
+```{r}
+rf_pred_prob_insample <- predict(rf_model_global, sim_binary, type = "prob")[, "1"]
+rf_pred_binary <- as.integer(rf_pred_prob_insample > 0.5)
+rf_validation_df <- sim_binary %>%
+  mutate(
+    predicted_prob = rf_pred_prob_insample,
+    predicted_purchase = rf_pred_binary
+  ) %>%
+  select(id, time, price, age, gender, urban, purchase, predicted_prob, predicted_purchase)
+
+head(rf_validation_df)
+
+#Calculate in-sample hit rate
+rf_hit_rate_insample <- mean(rf_validation_df$predicted_purchase == rf_validation_df$purchase)
+cat("In-sample Hit Rate for Random Forest:", rf_hit_rate_insample, "\n")
+
+
+```
+
+**testing data simulation**
+```{r}
+
+set.seed(999) 
+N_test <- 20
+T <- 10
+price_range <- c(3, 8)
+
+age_test <- sample(18:70, N_test, replace = TRUE)
+gender_test <- sample(c(0, 1), N_test, replace = TRUE)
+urban_test <- sample(c(0, 1), N_test, replace = TRUE)
+
+beta_i_test <- mvrnorm(n = N_test, mu = mu_, Sigma = Sigma_)
+
+sim_binary_test <- data.frame()
+
+for (i in 1:N_test) {
+  for (t in 1:T) {
+    price <- runif(1, price_range[1], price_range[2])
+    X <- c(1, price, age_test[i], gender_test[i], urban_test[i])
+    utility <- sum(X * beta_i_test[i, ])
+    p <- 1 / (1 + exp(-utility))
+    y <- rbinom(1, 1, p)
+    
+    sim_binary_test <- rbind(sim_binary_test, data.frame(
+      id = i + N,  # ensure IDs don't overlap with training data
+      time = t,
+      price = price,
+      age = age_test[i],
+      gender = gender_test[i],
+      urban = urban_test[i],
+      purchase = y
+    ))
+  }
+}
+
+head(sim_binary_test)
+
+```
+
+**ground truth for the testing data**
+```{r}
+purchase_prob <- function(X, beta) {
+  plogis(sum(X * beta))
+}
+
+expected_revenue <- function(price, X, beta) {
+  price * purchase_prob(X, beta)
+}
+price_options <- c(3, 8)
+ground_truth_test <- data.frame()
+
+# Loop through each of the 20 out-of-sample individuals
+for (i in 1:N_test) {
+  # Extract covariates for test individuals
+  indiv_covs <- c(age_test[i], gender_test[i], urban_test[i])
+
+  X3 <- c(1, 3, indiv_covs)
+  X8 <- c(1, 8, indiv_covs)
+  
+  prob_3 <- purchase_prob(X3, beta_i_test[i, ])
+  prob_8 <- purchase_prob(X8, beta_i_test[i, ])
+  
+  rev_3 <- expected_revenue(3, X3, beta_i_test[i, ])
+  rev_8 <- expected_revenue(8, X8, beta_i_test[i, ])
+  
+  opt_price <- ifelse(rev_3 > rev_8, 3, 8)
+  
+  ground_truth_test <- rbind(
+    ground_truth_test,
+    data.frame(
+      id = i + N,   # IDs start after training data
+      price = 3,
+      predicted_prob = prob_3,
+      predicted_revenue = rev_3,
+      optimal_price = opt_price
+    ),
+    data.frame(
+      id = i + N,
+      price = 8,
+      predicted_prob = prob_8,
+      predicted_revenue = rev_8,
+      optimal_price = opt_price
+    )
+  )
+}
+
+head(ground_truth_test)
+
+total_optimal_revenue_test <- ground_truth_test %>%
+  filter(price == optimal_price) %>%
+  summarise(total_revenue = sum(predicted_revenue)) %>%
+  pull(total_revenue)
+
+cat("Total ground truth optimal revenue for TEST sample:", total_optimal_revenue_test, "\n")
+
+
+```
+
+**Fitting the trained random forest on testing data, find the pricing policy and the expected total revenue  **
+```{r}
+
+testing_covs <- sim_binary_test %>%
+  group_by(id) %>%
+  dplyr::slice(1) %>% 
+  ungroup() %>%
+  select(id, age, gender, urban)
+
+price_given <- c(3, 8)
+
+newdata_test <- testing_covs %>%
+  tidyr::crossing(price = price_given) %>%
+  arrange(id, price)
+
+pred_probs_test <- predict(rf_model_global, newdata_test, type = "prob")[, "1"]
+
+rf_predictions_test <- newdata_test %>%
+  mutate(
+    predicted_prob = pred_probs_test,
+    predicted_revenue = predicted_prob * price
+  )
+
+#Select optimal price for each testing individual
+rf_best_prices_test <- rf_predictions_test %>%
+  group_by(id) %>%
+  slice_max(predicted_revenue, n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  select(id, rf_optimal_price = price)
+
+rf_predictions_test <- rf_predictions_test %>%
+  left_join(rf_best_prices_test, by = "id")
+
+head(rf_predictions_test)
+
+#Define true purchase probability and expected revenue functions
+purchase_prob <- function(p, a, g, u, alpha, beta_price, beta_age, beta_gender, beta_urban) {
+  linpred <- alpha + beta_price * p + beta_age * a + beta_gender * g + beta_urban * u
+  plogis(linpred)
+}
+
+expected_revenue <- function(p, a, g, u, alpha, beta_price, beta_age, beta_gender, beta_urban) {
+  p * purchase_prob(p, a, g, u, alpha, beta_price, beta_age, beta_gender, beta_urban)
+}
+
+# Evaluate RF pricing policy on testing data
+rf_eval_test <- rf_best_prices_test %>%
+  left_join(testing_covs, by = "id") %>%
+  mutate(
+    alpha       = beta_i_test[id - N, 1],
+    beta_price  = beta_i_test[id - N, 2],
+    beta_age    = beta_i_test[id - N, 3],
+    beta_gender = beta_i_test[id - N, 4],
+    beta_urban  = beta_i_test[id - N, 5]
+  )
+
+rf_eval_test <- rf_eval_test %>%
+  mutate(
+    true_prob = purchase_prob(rf_optimal_price, age, gender, urban,
+                              alpha, beta_price, beta_age, beta_gender, beta_urban),
+    true_revenue = expected_revenue(rf_optimal_price, age, gender, urban,
+                                    alpha, beta_price, beta_age, beta_gender, beta_urban)
+  )
+
+total_rf_policy_revenue_test <- sum(rf_eval_test$true_revenue)
+
+cat("Total expected revenue on testing data using RF policy:",
+    total_rf_policy_revenue_test, "\n")
+```
+
+**frequncy table of two prices under the rf pricing policy on testing dataset**
+```{r}
+rf_counts2 <- rf_predictions_test %>%
+  group_by(rf_optimal_price) %>%
+  summarise(count = n() / 2) %>%
+  arrange(rf_optimal_price)
+
+print(rf_counts2)
+```
+
+
+**hit rate on testing data**
+```{r}
+#Same as what training data did
+rf_pred_prob_test <- predict(rf_model_global, sim_binary_test, type = "prob")[, "1"]
+rf_pred_binary_test <- as.integer(rf_pred_prob_test > 0.5)
+
+rf_validation_test_df <- sim_binary_test %>%
+  mutate(
+    predicted_prob = rf_pred_prob_test,
+    predicted_purchase = rf_pred_binary_test
+  ) %>%
+  select(id, time, price, age, gender, urban, purchase, predicted_prob, predicted_purchase)
+
+head(rf_validation_test_df)
+
+rf_hit_rate_test <- mean(rf_validation_test_df$predicted_purchase == rf_validation_test_df$purchase)
+
+cat("Out-of-sample Hit Rate for Random Forest on Testing Data:", rf_hit_rate_test, "\n")
+
+```
+
+
